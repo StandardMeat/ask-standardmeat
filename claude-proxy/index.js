@@ -169,6 +169,14 @@ module.exports = async function (context, req) {
             content: `${contextBlock}User question: ${userMessage}`
         };
 
+        console.error('SZ history(messages)=', JSON.stringify(req.body.messages).length);
+        console.error('SZ allFiles count=', (typeof allFiles !== 'undefined' ? allFiles.length : 'n/a'));
+        console.error('SZ fileInventory=', fileInventory.length);
+        console.error('SZ topFiles count=', topFiles.length);
+        console.error('SZ fileContents=', fileContents.length);
+        console.error('SZ contextBlock=', contextBlock.length);
+        console.error('SZ enhancedBody=', JSON.stringify({ ...req.body, messages: enhancedMessages }).length);
+
         const claudeBody = { ...req.body, messages: enhancedMessages };
         const response = await fetch('https://api.anthropic.com/v1/messages', {
             method: 'POST',
