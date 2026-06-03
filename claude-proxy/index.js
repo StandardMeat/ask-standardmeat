@@ -1,20 +1,18 @@
 // claude-proxy/index.js — Ask Standard Meat retrieval proxy
 // Phase 1 (metadata-only index): model-driven tool-use loop.
-// Tools: search_files (find by keyword, metadata only) and
-//        read_file (pull the text of one file on demand).
+// Tools: search_files (metadata only) and read_file (one file's text on demand).
+//
+// IMPORTANT: heavy libraries (mammoth, xlsx, pdf-parse, @azure/storage-blob) are
+// required INSIDE the functions that use them, never at module top level. Per the
+// build-index startup lesson (AZFD0005 / "node exited with code 1" / gRPC 14
+// UNAVAILABLE), heavy top-level requires run in the worker init window and can crash
+// the host<->worker handshake on cold start.
 
-const mammoth = require('mammoth');
-const XLSX = require('xlsx');
-const pdfParse = require('pdf-parse');
 const { getGraphToken, getSiteId } = require('../shared/graph');
-// NOTE: @azure/storage-blob is required INSIDE loadIndex (not at module top) —
-// per the build-index startup-crash lesson, heavy top-level requires can break
-// the host<->worker gRPC handshake during the worker init window.
 
 const MAX_TOOL_ITERATIONS = 5;
 
-// Folders whose contents must never be read or surfaced (sensitive PII — a former
-// employee's W-2/1099/tax dump). Matched as a lowercase substring of the file path.
+// Folders whose contents must never be read or surfaced (sensitive PII).
 // Stopgap guardrail; the durable fix is removing/locking these files in SharePoint.
 const RESTRICTED_PATHS = [
     'shabaka documents/admin/dload/'
@@ -33,7 +31,7 @@ const EXPANSIONS = {
 const TOOLS = [
     {
         name: 'search_files',
-        description: 'Search the Standard Meat SharePoint document library by keyword. Matches against file names, paths, and folder names. Returns up to 15 matching files as metadata only: name, path, folder, file extension, and an openable SharePoint link. To read the actual contents of a file, call read_file with the file\'s path (the "path" field from these results).',
+        description: 'Search the Standard Meat SharePoint document library by keyword. Matches against file names, paths, and folder names. Returns up to 15 matching files as metadata only: name, path, folder, file extension, and an openable SharePoint link. To read the actual contents of a file, call read_file with the file path (the "path" field from these results).',
         input_schema: {
             type: 'object',
             properties: {
@@ -61,7 +59,6 @@ const TOOLS = [
     }
 ];
 
-// Module-level cache (just a null reference at load time — no heavy work here).
 let cachedIndex = null;
 
 async function loadIndex(context) {
@@ -84,44 +81,47 @@ async function loadIndex(context) {
 
 function isRestricted(path) {
     const p = String(path || '').toLowerCase();
-    return RESTRICTED_PATHS.some(r => p.includes(r));
+    return RESTRICTED_PATHS.some(function (r) { return p.includes(r); });
 }
 
 function searchFiles(query, files) {
     const text = String(query || '').toLowerCase();
-    let keywords = (text.match(/[a-z_]{2,}/g) || []).filter(w => !STOP_WORDS.has(w) && w.length >= 2);
+    let keywords = (text.match(/[a-z_]{2,}/g) || []).filter(function (w) { return !STOP_WORDS.has(w) && w.length >= 2; });
 
     const expanded = new Set(keywords);
     for (const kw of keywords) {
-        if (EXPANSIONS[kw]) EXPANSIONS[kw].forEach(e => expanded.add(e));
+        if (EXPANSIONS[kw]) EXPANSIONS[kw].forEach(function (e) { expanded.add(e); });
     }
     for (const phrase in EXPANSIONS) {
-        if (phrase.includes(' ') && text.includes(phrase)) EXPANSIONS[phrase].forEach(e => expanded.add(e));
+        if (phrase.includes(' ') && text.includes(phrase)) EXPANSIONS[phrase].forEach(function (e) { expanded.add(e); });
     }
-    keywords = Array.from(expanded).filter(w => w.length >= 2);
+    keywords = Array.from(expanded).filter(function (w) { return w.length >= 2; });
     if (keywords.length === 0) return [];
 
-    const visible = files.filter(f => !isRestricted(f.path));
+    const visible = files.filter(function (f) { return !isRestricted(f.path); });
     const scored = visible
-        .map(f => {
+        .map(function (f) {
             const name = (f.name || '').toLowerCase();
             const path = (f.path || '').toLowerCase();
             const folder = (f.folder || '').toLowerCase();
-            const score = keywords.reduce((acc, kw) =>
-                acc + (name.includes(kw) ? 2 : 0) + (path.includes(kw) ? 1 : 0) + (folder.includes(kw) ? 1 : 0), 0);
-            return { f, score };
+            const score = keywords.reduce(function (acc, kw) {
+                return acc + (name.includes(kw) ? 2 : 0) + (path.includes(kw) ? 1 : 0) + (folder.includes(kw) ? 1 : 0);
+            }, 0);
+            return { f: f, score: score };
         })
-        .filter(x => x.score > 0)
-        .sort((a, b) => b.score - a.score)
+        .filter(function (x) { return x.score > 0; })
+        .sort(function (a, b) { return b.score - a.score; })
         .slice(0, 15);
 
-    return scored.map(x => ({
-        name: x.f.name,
-        path: x.f.path,
-        folder: x.f.folder,
-        ext: x.f.ext,
-        webUrl: x.f.webUrl
-    }));
+    return scored.map(function (x) {
+        return {
+            name: x.f.name,
+            path: x.f.path,
+            folder: x.f.folder,
+            ext: x.f.ext,
+            webUrl: x.f.webUrl
+        };
+    });
 }
 
 async function readFile(path, context) {
@@ -131,10 +131,10 @@ async function readFile(path, context) {
     }
 
     const wanted = String(path || '');
-    let entry = files.find(f => f.path === wanted);
+    let entry = files.find(function (f) { return f.path === wanted; });
     if (!entry) {
         const lower = wanted.toLowerCase();
-        entry = files.find(f => (f.path || '').toLowerCase() === lower);
+        entry = files.find(function (f) { return (f.path || '').toLowerCase() === lower; });
     }
     if (!entry) {
         return 'No file found at path: ' + wanted + '. Use search_files first and pass the exact "path" value it returns.';
@@ -160,16 +160,19 @@ async function readFile(path, context) {
         let textContent = '';
 
         if (ext === 'docx') {
+            const mammoth = require('mammoth');
             const buffer = Buffer.from(await contentResponse.arrayBuffer());
-            const result = await mammoth.extractRawText({ buffer });
+            const result = await mammoth.extractRawText({ buffer: buffer });
             textContent = result.value;
         } else if (ext === 'xlsx' || ext === 'xls') {
+            const XLSX = require('xlsx');
             const buffer = Buffer.from(await contentResponse.arrayBuffer());
             const workbook = XLSX.read(buffer, { type: 'buffer' });
             textContent = workbook.SheetNames.map(function (name) {
                 return 'Sheet: ' + name + '\n' + XLSX.utils.sheet_to_csv(workbook.Sheets[name]);
             }).join('\n\n');
         } else if (ext === 'pdf') {
+            const pdfParse = require('pdf-parse');
             const buffer = Buffer.from(await contentResponse.arrayBuffer());
             const data = await pdfParse(buffer);
             textContent = data.text;
