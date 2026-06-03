@@ -3,14 +3,13 @@
 // Tools: search_files (metadata only) and read_file (one file's text on demand).
 //
 // IMPORTANT: heavy libraries (mammoth, xlsx, pdf-parse, @azure/storage-blob) are
-// required INSIDE the functions that use them, never at module top level. Per the
-// build-index startup lesson (AZFD0005 / "node exited with code 1" / gRPC 14
-// UNAVAILABLE), heavy top-level requires run in the worker init window and can crash
-// the host<->worker handshake on cold start.
+// required INSIDE the functions that use them, never at module top level (AZFD0005
+// startup-handshake lesson). The final "force a text answer" call keeps tools defined
+// (so the tool_use/tool_result history stays valid) and uses tool_choice "none".
 
 const { getGraphToken, getSiteId } = require('../shared/graph');
 
-const MAX_TOOL_ITERATIONS = 5;
+const MAX_TOOL_ITERATIONS = 8;
 
 // Folders whose contents must never be read or surfaced (sensitive PII).
 // Stopgap guardrail; the durable fix is removing/locking these files in SharePoint.
@@ -206,12 +205,14 @@ async function runTool(name, input, context) {
     return 'Unknown tool: ' + name;
 }
 
-async function callClaude(baseBody, messages, tools) {
+async function callClaude(baseBody, messages, tools, forceText) {
     const body = Object.assign({}, baseBody, { messages: messages });
     if (tools) {
         body.tools = tools;
+        body.tool_choice = forceText ? { type: 'none' } : { type: 'auto' };
     } else {
         delete body.tools;
+        delete body.tool_choice;
     }
     const response = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
@@ -272,7 +273,7 @@ module.exports = async function (context, req) {
         }
 
         context.log('Tool-use loop hit iteration cap; forcing a final answer with no tools.');
-        data = await callClaude(baseBody, messages, null);
+        data = await callClaude(baseBody, messages, TOOLS, true);
         context.res.status = 200;
         context.res.body = JSON.stringify(data);
     } catch (err) {
