@@ -1,6 +1,7 @@
 const mammoth = require('mammoth');
 const XLSX = require('xlsx');
 const pdfParse = require('pdf-parse');
+const { getGraphToken, getSiteId, listAllFiles } = require('../shared/graph');
 
 module.exports = async function (context, req) {
     context.res = {
@@ -21,55 +22,9 @@ module.exports = async function (context, req) {
         const userMessage = req.body.messages[req.body.messages.length - 1].content;
         context.log('User message:', userMessage);
 
-        const tokenResponse = await fetch(
-            `https://login.microsoftonline.com/${process.env.SHAREPOINT_TENANT_ID}/oauth2/v2.0/token`,
-            {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                body: new URLSearchParams({
-                    client_id: process.env.SHAREPOINT_CLIENT_ID,
-                    client_secret: process.env.SHAREPOINT_CLIENT_SECRET,
-                    scope: 'https://graph.microsoft.com/.default',
-                    grant_type: 'client_credentials'
-                })
-            }
-        );
-
-        const tokenData = await tokenResponse.json();
-        if (!tokenData.access_token) throw new Error('Failed to get Graph token');
-        const graphToken = tokenData.access_token;
-
-        const siteResponse = await fetch(
-            'https://graph.microsoft.com/v1.0/sites/standardmeatco.sharepoint.com:/sites/ClaudePilot',
-            { headers: { 'Authorization': `Bearer ${graphToken}` } }
-        );
-        const siteData = await siteResponse.json();
-        if (!siteData.id) throw new Error('Failed to get site ID');
-        const siteId = siteData.id;
-
-        async function listAllFiles(folderPath = '') {
-            if (folderPath.includes('.git') || folderPath.includes('node_modules')) return [];
-            const url = folderPath
-                ? `https://graph.microsoft.com/v1.0/sites/${siteId}/drive/root:/${encodeURIComponent(folderPath)}:/children?$top=500`
-                : `https://graph.microsoft.com/v1.0/sites/${siteId}/drive/root/children?$top=500`;
-            const response = await fetch(url, { headers: { 'Authorization': `Bearer ${graphToken}` } });
-            const data = await response.json();
-            const items = data.value || [];
-            let allFiles = [];
-            for (const item of items) {
-                if (item.file) {
-                    allFiles.push({ ...item, folderPath });
-                } else if (item.folder) {
-                    if (item.name.startsWith('.')) continue;
-                    const subPath = folderPath ? `${folderPath}/${item.name}` : item.name;
-                    const subFiles = await listAllFiles(subPath);
-                    allFiles = allFiles.concat(subFiles);
-                }
-            }
-            return allFiles;
-        }
-
-        const allFiles = await listAllFiles();
+        const graphToken = await getGraphToken();
+        const siteId = await getSiteId(graphToken);
+        const allFiles = await listAllFiles(graphToken, siteId);
         context.log('Total files found:', allFiles.length);
 
         const stopWords = new Set(['that','this','with','from','find','show','what','have','will','where','when','which','about','your','they','them','there','their','would','could','should','please','refer','look','tell','give','make','need','want','help','using','sends','pulling','scripts','script','file','files','process','actually','looking','supposed','then','another','how','many','are','in','on','at','of','an','the','do','does','did','was','were','been','being','can','also','any','all','some','our']);
@@ -168,14 +123,6 @@ module.exports = async function (context, req) {
             role: 'user',
             content: `${contextBlock}User question: ${userMessage}`
         };
-
-        console.error('SZ history(messages)=', JSON.stringify(req.body.messages).length);
-        console.error('SZ allFiles count=', (typeof allFiles !== 'undefined' ? allFiles.length : 'n/a'));
-        console.error('SZ fileInventory=', fileInventory.length);
-        console.error('SZ topFiles count=', topFiles.length);
-        console.error('SZ fileContents=', fileContents.length);
-        console.error('SZ contextBlock=', contextBlock.length);
-        console.error('SZ enhancedBody=', JSON.stringify({ ...req.body, messages: enhancedMessages }).length);
 
         const claudeBody = { ...req.body, messages: enhancedMessages };
         const response = await fetch('https://api.anthropic.com/v1/messages', {
