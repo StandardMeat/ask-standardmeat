@@ -5,7 +5,7 @@ const SOURCE = 'ClaudePilot Workspace';
 const CONTAINER = 'index';
 const BLOB_NAME = 'file-index.json';
 
-module.exports = async function (context, req) {
+module.exports = async function (context, myTimer) {
     try {
         const token = await getGraphToken();
         const siteId = await getSiteId(token);
@@ -45,21 +45,9 @@ module.exports = async function (context, req) {
             blobHTTPHeaders: { blobContentType: 'application/json' }
         });
 
-        context.res = {
-            status: 200,
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                count: output.count,
-                generatedAt: output.generatedAt,
-                blob: `${CONTAINER}/${BLOB_NAME}`
-            })
-        };
+        context.log(`build-index done: count=${output.count} generatedAt=${output.generatedAt} blob=${CONTAINER}/${BLOB_NAME}`);
     } catch (err) {
         context.log('build-index error:', err.message);
-        context.res = {
-            status: 500,
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ error: err.message })
-        };
+        throw err;
     }
 };
