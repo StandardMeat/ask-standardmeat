@@ -1,4 +1,3 @@
-const { BlobServiceClient } = require('@azure/storage-blob');
 const { getGraphToken, getSiteId, listAllFiles } = require('../shared/graph');
 
 const SOURCE = 'ClaudePilot Workspace';
@@ -7,6 +6,7 @@ const BLOB_NAME = 'file-index.json';
 
 module.exports = async function (context, myTimer) {
     try {
+        const { BlobServiceClient } = require('@azure/storage-blob');
         const token = await getGraphToken();
         const siteId = await getSiteId(token);
         const rawFiles = await listAllFiles(token, siteId);
@@ -47,7 +47,6 @@ module.exports = async function (context, myTimer) {
 
         context.log(`build-index done: count=${output.count} generatedAt=${output.generatedAt} blob=${CONTAINER}/${BLOB_NAME}`);
     } catch (err) {
-        context.log('build-index error:', err.message);
-        throw err;
+        context.log.error('BUILD-INDEX FAILED:', err && err.stack ? err.stack : String(err));
     }
 };
