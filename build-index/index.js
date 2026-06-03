@@ -48,5 +48,6 @@ module.exports = async function (context, myTimer) {
         context.log(`build-index done: count=${output.count} generatedAt=${output.generatedAt} blob=${CONTAINER}/${BLOB_NAME}`);
     } catch (err) {
         context.log.error('BUILD-INDEX FAILED:', err && err.stack ? err.stack : String(err));
+        throw err;
     }
 };
