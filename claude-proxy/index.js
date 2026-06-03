@@ -1,11 +1,8 @@
 // claude-proxy/index.js — Ask Standard Meat retrieval proxy
-// Phase 1 (metadata-only): model-driven tool-use loop.
-// Replaces the old full-library inventory injection (which overflowed the
-// 200K prompt limit) — the assistant now calls search_files on demand instead
-// of receiving every filename up front. This step adds search_files only;
-// list_folder and read_file come in later steps.
+// Phase 1 (metadata-only index): model-driven tool-use loop.
+// Tools: search_files (find by keyword, metadata only) and
+//        read_file (pull the text of one file on demand).
 
-// Content libs + Graph helpers are retained for read_file (added in a later step).
 const mammoth = require('mammoth');
 const XLSX = require('xlsx');
 const pdfParse = require('pdf-parse');
@@ -15,6 +12,13 @@ const { getGraphToken, getSiteId } = require('../shared/graph');
 // the host<->worker gRPC handshake during the worker init window.
 
 const MAX_TOOL_ITERATIONS = 5;
+
+// Folders whose contents must never be read or surfaced (sensitive PII — a former
+// employee's W-2/1099/tax dump). Matched as a lowercase substring of the file path.
+// Stopgap guardrail; the durable fix is removing/locking these files in SharePoint.
+const RESTRICTED_PATHS = [
+    'shabaka documents/admin/dload/'
+];
 
 const STOP_WORDS = new Set(['that','this','with','from','find','show','what','have','will','where','when','which','about','your','they','them','there','their','would','could','should','please','refer','look','tell','give','make','need','want','help','using','sends','pulling','scripts','script','file','files','process','actually','looking','supposed','then','another','how','many','are','in','on','at','of','an','the','do','does','did','was','were','been','being','can','also','any','all','some','our']);
 
@@ -29,7 +33,7 @@ const EXPANSIONS = {
 const TOOLS = [
     {
         name: 'search_files',
-        description: 'Search the Standard Meat SharePoint document library by keyword. Matches against file names, paths, and folder names. Returns up to 15 matching files as metadata only: name, path, folder, file extension, and an openable SharePoint link. This tool does NOT return file contents. Use it to locate relevant files for the user\'s question. Reading file contents is not yet available, so base your answer on the file names and paths returned.',
+        description: 'Search the Standard Meat SharePoint document library by keyword. Matches against file names, paths, and folder names. Returns up to 15 matching files as metadata only: name, path, folder, file extension, and an openable SharePoint link. To read the actual contents of a file, call read_file with the file\'s path (the "path" field from these results).',
         input_schema: {
             type: 'object',
             properties: {
@@ -39,6 +43,20 @@ const TOOLS = [
                 }
             },
             required: ['query']
+        }
+    },
+    {
+        name: 'read_file',
+        description: 'Read the text contents of a single file from the SharePoint library, given its exact path as returned by search_files. Supports Word (.docx), Excel (.xlsx/.xls), PDF, and plain-text files. Returns up to ~30,000 characters of extracted text. Call this after search_files, before answering questions about what a file actually contains.',
+        input_schema: {
+            type: 'object',
+            properties: {
+                path: {
+                    type: 'string',
+                    description: 'The exact file path to read, copied from the "path" field of a search_files result.'
+                }
+            },
+            required: ['path']
         }
     }
 ];
@@ -64,6 +82,11 @@ async function loadIndex(context) {
     }
 }
 
+function isRestricted(path) {
+    const p = String(path || '').toLowerCase();
+    return RESTRICTED_PATHS.some(r => p.includes(r));
+}
+
 function searchFiles(query, files) {
     const text = String(query || '').toLowerCase();
     let keywords = (text.match(/[a-z_]{2,}/g) || []).filter(w => !STOP_WORDS.has(w) && w.length >= 2);
@@ -78,7 +101,8 @@ function searchFiles(query, files) {
     keywords = Array.from(expanded).filter(w => w.length >= 2);
     if (keywords.length === 0) return [];
 
-    const scored = files
+    const visible = files.filter(f => !isRestricted(f.path));
+    const scored = visible
         .map(f => {
             const name = (f.name || '').toLowerCase();
             const path = (f.path || '').toLowerCase();
@@ -100,6 +124,67 @@ function searchFiles(query, files) {
     }));
 }
 
+async function readFile(path, context) {
+    const files = await loadIndex(context);
+    if (!files) {
+        return 'The search index is currently unavailable. Tell the user that file access is temporarily unavailable.';
+    }
+
+    const wanted = String(path || '');
+    let entry = files.find(f => f.path === wanted);
+    if (!entry) {
+        const lower = wanted.toLowerCase();
+        entry = files.find(f => (f.path || '').toLowerCase() === lower);
+    }
+    if (!entry) {
+        return 'No file found at path: ' + wanted + '. Use search_files first and pass the exact "path" value it returns.';
+    }
+
+    if (isRestricted(entry.path)) {
+        context.log('Blocked restricted file read:', entry.path);
+        return 'That file is in a restricted folder containing sensitive personal/HR data and cannot be read.';
+    }
+
+    try {
+        const graphToken = await getGraphToken();
+        const siteId = await getSiteId(graphToken);
+        const contentResponse = await fetch(
+            'https://graph.microsoft.com/v1.0/sites/' + siteId + '/drive/items/' + entry.id + '/content',
+            { headers: { 'Authorization': 'Bearer ' + graphToken } }
+        );
+        if (!contentResponse.ok) {
+            return 'Could not download the file (status ' + contentResponse.status + ').';
+        }
+
+        const ext = (entry.ext || entry.name.split('.').pop() || '').toLowerCase();
+        let textContent = '';
+
+        if (ext === 'docx') {
+            const buffer = Buffer.from(await contentResponse.arrayBuffer());
+            const result = await mammoth.extractRawText({ buffer });
+            textContent = result.value;
+        } else if (ext === 'xlsx' || ext === 'xls') {
+            const buffer = Buffer.from(await contentResponse.arrayBuffer());
+            const workbook = XLSX.read(buffer, { type: 'buffer' });
+            textContent = workbook.SheetNames.map(function (name) {
+                return 'Sheet: ' + name + '\n' + XLSX.utils.sheet_to_csv(workbook.Sheets[name]);
+            }).join('\n\n');
+        } else if (ext === 'pdf') {
+            const buffer = Buffer.from(await contentResponse.arrayBuffer());
+            const data = await pdfParse(buffer);
+            textContent = data.text;
+        } else {
+            textContent = await contentResponse.text();
+        }
+
+        context.log('Read file:', entry.path, 'type:', ext, 'length:', textContent.length);
+        return '=== FILE: ' + entry.path + ' ===\n' + textContent.substring(0, 30000);
+    } catch (e) {
+        context.log('Error reading file:', entry.path, e.message);
+        return 'Error reading the file: ' + e.message;
+    }
+}
+
 async function runTool(name, input, context) {
     if (name === 'search_files') {
         const files = await loadIndex(context);
@@ -112,11 +197,14 @@ async function runTool(name, input, context) {
         }
         return JSON.stringify(hits);
     }
-    return `Unknown tool: ${name}`;
+    if (name === 'read_file') {
+        return await readFile(input && input.path, context);
+    }
+    return 'Unknown tool: ' + name;
 }
 
 async function callClaude(baseBody, messages, tools) {
-    const body = { ...baseBody, messages };
+    const body = Object.assign({}, baseBody, { messages: messages });
     if (tools) {
         body.tools = tools;
     } else {
@@ -151,7 +239,7 @@ module.exports = async function (context, req) {
 
     try {
         const baseBody = req.body;
-        const messages = [...(baseBody.messages || [])];
+        const messages = (baseBody.messages || []).slice();
 
         let data;
         for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
@@ -163,7 +251,6 @@ module.exports = async function (context, req) {
                 return;
             }
 
-            // Claude wants a tool. Record its turn, run the tool(s), feed results back.
             messages.push({ role: 'assistant', content: data.content });
 
             const toolResults = [];
@@ -181,7 +268,6 @@ module.exports = async function (context, req) {
             messages.push({ role: 'user', content: toolResults });
         }
 
-        // Iteration cap reached while still requesting tools — force a final text answer.
         context.log('Tool-use loop hit iteration cap; forcing a final answer with no tools.');
         data = await callClaude(baseBody, messages, null);
         context.res.status = 200;
