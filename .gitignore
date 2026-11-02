@@ -1,0 +1,30 @@
+# --- Secrets / local config (never commit) ---
+local.settings.json
+.env
+.env.*
+*.PublishSettings
+*.publishsettings
+*.pfx
+*.pem
+*.p12
+*.key
+*.cer
+
+# --- OS / editor ---
+.DS_Store
+.vscode/
+.idea/
+
+# --- Node / build ---
+node_modules/
+*.log
+.azure/
+
+# --- Local working files (not part of the app) ---
+Claude outputs/
+Videos/
+*.docx
+*.xlsx
+*.pdf
+*.zip
+ask-standardmeat-retrieval-rearchitecture-status.md
