@@ -11,6 +11,38 @@ const { getGraphToken, getSiteId } = require('../shared/graph');
 
 const MAX_TOOL_ITERATIONS = 8;
 
+// Request settings are fixed on the server. The browser only sends { messages };
+// any other fields in the client body (system, model, max_tokens, tools, etc.) are ignored.
+const MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6';
+const MAX_TOKENS = 1024;
+
+// Limits on what the client may send.
+const MAX_MESSAGES = 40;
+const MAX_CHARS_PER_MESSAGE = 20000;
+const MAX_CHARS_TOTAL = 100000;
+
+// System prompt (moved verbatim from index.html).
+const SYSTEM_PROMPT = `You are the Ask Standard Meat assistant, an internal AI assistant for Standard Meat Company employees. You answer questions using the documents in the ClaudePilot SharePoint library, which includes the Shabaka Scripts (SQL and PowerShell scripts that run against Standard Meat's production systems) and the Aspen Webhooks API and integration documentation for the Canopy ERP system. New documents are added over time.
+
+You have two tools for reaching these documents:
+- search_files(query): returns up to 15 matching files as metadata only — name, path, folder, file type, and a SharePoint link. It does not return file contents.
+- read_file(path): returns the extracted text of one file, given the exact path from a search_files result.
+
+How to answer:
+- When a question involves any file, script, integration, or document, call search_files first to find the relevant files. Searching is expected and normal — do it whenever it would help.
+- Before describing what a file or script actually contains or does, call read_file on the most relevant result(s) and base your answer on what you read. Do not guess a file's contents from its name alone, and do not claim to know what a script does unless you have read it.
+- If search_files returns nothing useful, say so and ask the user to rephrase or add detail, rather than inventing an answer.
+
+Guidelines:
+- Always reference files by their specific file name, and include the path when it helps.
+- Flag anything that touches or modifies production systems.
+- If you find duplicate or conflicting scripts, point that out.
+- Be conservative: if you are unsure what a script does, say so rather than guessing.
+- Keep data and integrations secure; never expose credentials, secrets, or sensitive personal information.
+- For multi-step tasks, work one step at a time so each step can be confirmed before moving on.
+
+You do not have a pre-loaded list of every file, and the library is large, so rely on search_files to find what you need for each question.`;
+
 // Folders whose contents must never be read or surfaced (sensitive PII).
 // Stopgap guardrail; the durable fix is removing/locking these files in SharePoint.
 const RESTRICTED_PATHS = [
@@ -205,15 +237,52 @@ async function runTool(name, input, context) {
     return 'Unknown tool: ' + name;
 }
 
-async function callClaude(baseBody, messages, tools, forceText) {
-    const body = Object.assign({}, baseBody, { messages: messages });
-    if (tools) {
-        body.tools = tools;
-        body.tool_choice = forceText ? { type: 'none' } : { type: 'auto' };
-    } else {
-        delete body.tools;
-        delete body.tool_choice;
+// Check the client's messages and return a clean copy, or null if anything is invalid.
+// Only plain text is accepted; tool_use/tool_result blocks are created by the server alone.
+function validateMessages(messages) {
+    if (!Array.isArray(messages) || messages.length === 0 || messages.length > MAX_MESSAGES) return null;
+
+    const clean = [];
+    let total = 0;
+    for (const m of messages) {
+        if (!m || typeof m !== 'object') return null;
+        if (m.role !== 'user' && m.role !== 'assistant') return null;
+
+        let content;
+        let chars = 0;
+        if (typeof m.content === 'string') {
+            content = m.content;
+            chars = content.length;
+        } else if (Array.isArray(m.content) && m.content.length > 0) {
+            content = [];
+            for (const block of m.content) {
+                if (!block || block.type !== 'text' || typeof block.text !== 'string') return null;
+                content.push({ type: 'text', text: block.text });
+                chars += block.text.length;
+            }
+        } else {
+            return null;
+        }
+
+        if (chars > MAX_CHARS_PER_MESSAGE) return null;
+        total += chars;
+        if (total > MAX_CHARS_TOTAL) return null;
+        clean.push({ role: m.role, content: content });
     }
+
+    if (clean[clean.length - 1].role !== 'user') return null;
+    return clean;
+}
+
+async function callClaude(messages, forceText) {
+    const body = {
+        model: MODEL,
+        max_tokens: MAX_TOKENS,
+        system: SYSTEM_PROMPT,
+        tools: TOOLS,
+        tool_choice: forceText ? { type: 'none' } : { type: 'auto' },
+        messages: messages
+    };
     const response = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: {
@@ -242,12 +311,16 @@ module.exports = async function (context, req) {
     }
 
     try {
-        const baseBody = req.body;
-        const messages = (baseBody.messages || []).slice();
+        const messages = validateMessages(req.body && req.body.messages);
+        if (!messages) {
+            context.res.status = 400;
+            context.res.body = JSON.stringify({ error: 'Invalid request.' });
+            return;
+        }
 
         let data;
         for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
-            data = await callClaude(baseBody, messages, TOOLS);
+            data = await callClaude(messages);
 
             if (data.stop_reason !== 'tool_use') {
                 context.res.status = 200;
@@ -273,7 +346,7 @@ module.exports = async function (context, req) {
         }
 
         context.log('Tool-use loop hit iteration cap; forcing a final answer with no tools.');
-        data = await callClaude(baseBody, messages, TOOLS, true);
+        data = await callClaude(messages, true);
         context.res.status = 200;
         context.res.body = JSON.stringify(data);
     } catch (err) {
